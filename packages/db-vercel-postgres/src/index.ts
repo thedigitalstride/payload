@@ -41,6 +41,7 @@ import {
   updateOne,
   updateVersion,
   upsert,
+  validateOperatorHandlers,
 } from '@payloadcms/drizzle'
 import {
   columnToCodeConverter,
@@ -93,6 +94,10 @@ export function vercelPostgresAdapter(args: Args = {}): DatabaseAdapterObj<Verce
       return acc
     }, {})
 
+    const operatorHandlers = args.query?.operatorHandlers ?? []
+
+    validateOperatorHandlers(operatorHandlers)
+
     const executeMethod = 'execute'
     const sanitizeStatements = ({
       sqlExecute,
@@ -135,6 +140,7 @@ export function vercelPostgresAdapter(args: Args = {}): DatabaseAdapterObj<Verce
       initializing,
       localesSuffix: args.localesSuffix || '_locales',
       logger: args.logger,
+      operatorHandlers,
       operators: operatorMap,
       pgSchema: adapterSchema,
       pool: undefined,
@@ -202,6 +208,7 @@ export function vercelPostgresAdapter(args: Args = {}): DatabaseAdapterObj<Verce
       payload,
       queryDrafts,
       readReplicaOptions: args.readReplicas,
+      readReplicasAfterWriteInterval: args.readReplicasAfterWriteInterval ?? 2000,
       // @ts-expect-error - vestiges of when tsconfig was not strict. Feel free to improve
       rejectInitializing,
       requireDrizzleKit,
@@ -241,6 +248,11 @@ export type {
   GeneratedDatabaseSchema,
   VercelPostgresAdapter,
 } from './types.js'
-export type { MigrateDownArgs, MigrateUpArgs } from '@payloadcms/drizzle/postgres'
-export { geometryColumn } from '@payloadcms/drizzle/postgres'
+export type {
+  MigrateDownArgs,
+  MigrateUpArgs,
+  PostgresOperatorHandler,
+  PostgresQueryConfig,
+} from '@payloadcms/drizzle/postgres'
+export { geometryColumn, postgresUnaccent } from '@payloadcms/drizzle/postgres'
 export { sql } from 'drizzle-orm'

@@ -2,27 +2,33 @@ import type { ContainerClient } from '@azure/storage-blob'
 import type { CollectionSlug, Payload } from 'payload'
 
 import { BlobServiceClient } from '@azure/storage-blob'
+import { readFile } from 'node:fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { expect } from 'vitest'
 
-import type { NextRESTClient } from '../__helpers/shared/NextRESTClient.js'
-
-import { initPayloadInt } from '../__helpers/shared/initPayloadInt.js'
-import { mediaSlug, mediaWithPrefixSlug, prefix } from './shared.js'
+import { test } from '../__helpers/int/vitest.js'
+import {
+  mediaSlug,
+  mediaWithAlwaysInsertFieldsSlug,
+  mediaWithPrefixSlug,
+  prefix,
+} from './shared.js'
 
 const filename = fileURLToPath(import.meta.url)
 const dirname = path.dirname(filename)
 
-let restClient: NextRESTClient
-let payload: Payload
-
-describe('@payloadcms/storage-azure', () => {
+test.suite({ config: './config.ts', resetBetweenTests: false })('@payloadcms/storage-azure', () => {
   let TEST_CONTAINER: string
   let client: ContainerClient
 
-  beforeAll(async () => {
-    ;({ payload, restClient } = await initPayloadInt(dirname))
+  const clearContainer = async () => {
+    for await (const blob of client.listBlobsFlat()) {
+      await client.deleteBlob(blob.name)
+    }
+  }
+
+  test.beforeAll(async () => {
     TEST_CONTAINER = process.env.AZURE_STORAGE_CONTAINER_NAME!
 
     const blobServiceClient = BlobServiceClient.fromConnectionString(
@@ -34,15 +40,25 @@ describe('@payloadcms/storage-azure', () => {
     await clearContainer()
   }, 90000)
 
-  afterAll(async () => {
-    await payload.destroy()
-  })
-
-  afterEach(async () => {
+  test.afterEach(async () => {
     await clearContainer()
   })
 
-  it('can upload', async () => {
+  test('preserves mime type when uploaded via rest endpoint', async ({ restClient }) => {
+    const fileBuffer = await readFile(`${dirname}/../uploads/image.png`)
+
+    const data = new FormData()
+    data.append('file', new Blob([fileBuffer], { type: 'image/png' }), 'image2.png')
+    const newMedia: { doc: { url: string } } = await (
+      await restClient.POST('/media', {
+        body: data,
+      })
+    ).json()
+    const response = await restClient.GET(newMedia.doc.url.replace(/^\/api/, '') as `/${string}`)
+    expect(response.headers.get('content-type')).toEqual('image/png')
+  })
+
+  test('can upload', async ({ payload }) => {
     const upload = await payload.create({
       collection: mediaSlug,
       data: {},
@@ -50,11 +66,11 @@ describe('@payloadcms/storage-azure', () => {
     })
 
     expect(upload.id).toBeTruthy()
-    await verifyUploads({ collectionSlug: mediaSlug, uploadId: upload.id })
+    await verifyUploads({ payload }, { collectionSlug: mediaSlug, uploadId: upload.id })
     expect(upload.url).toEqual(`/api/${mediaSlug}/file/${String(upload.filename)}`)
   })
 
-  it('can upload with prefix', async () => {
+  test('can upload with prefix', async ({ payload }) => {
     const upload = await payload.create({
       collection: mediaWithPrefixSlug,
       data: {},
@@ -62,43 +78,59 @@ describe('@payloadcms/storage-azure', () => {
     })
 
     expect(upload.id).toBeTruthy()
-    await verifyUploads({
-      collectionSlug: mediaWithPrefixSlug,
-      uploadId: upload.id,
-      prefix,
-    })
-    expect(upload.url).toEqual(`/api/${mediaWithPrefixSlug}/file/${String(upload.filename)}`)
+    await verifyUploads(
+      { payload },
+      {
+        collectionSlug: mediaWithPrefixSlug,
+        uploadId: upload.id,
+        prefix,
+      },
+    )
+    expect(upload.url).toEqual(
+      `/api/${mediaWithPrefixSlug}/file/${String(upload.filename)}?prefix=${prefix}`,
+    )
   })
 
-  it('returns 404 for non-existing file', async () => {
+  test('returns 404 for non-existing file', async ({ restClient }) => {
     const response = await restClient.GET(`/${mediaSlug}/file/nonexistent.png`)
     expect(response.status).toBe(404)
   })
 
-  async function clearContainer() {
-    for await (const blob of client.listBlobsFlat()) {
-      await client.deleteBlob(blob.name)
-    }
-  }
+  test('has prefix field by default even when plugin is disabled', async ({ payload }) => {
+    // This collection uses an azureStorage plugin with enabled: false.
+    // The upload uses local storage, but the prefix field still exists.
+    const upload = await payload.create({
+      collection: mediaWithAlwaysInsertFieldsSlug,
+      data: {
+        prefix: 'test',
+      },
+      filePath: path.resolve(dirname, '../uploads/image.png'),
+    })
 
-  async function verifyUploads({
-    collectionSlug,
-    uploadId,
-    prefix = '',
-  }: {
-    collectionSlug: CollectionSlug
-    prefix?: string
-    uploadId: number | string
-  }) {
+    expect(upload.id).toBeTruthy()
+    expect(upload.prefix).toBe('test')
+  })
+
+  async function verifyUploads(
+    { payload }: { payload: Payload },
+    {
+      collectionSlug,
+      uploadId,
+      prefix = '',
+    }: {
+      collectionSlug: CollectionSlug
+      prefix?: string
+      uploadId: number | string
+    },
+  ) {
     const uploadData = (await payload.findByID({
       collection: collectionSlug,
       id: uploadId,
     })) as unknown as { filename: string; sizes: Record<string, { filename: string }> }
 
-    const fileKeys = Object.keys(uploadData.sizes || {}).map((key) => {
-      const rawFilename = uploadData.sizes[key].filename
-      return prefix ? `${prefix}/${rawFilename}` : rawFilename
-    })
+    const fileKeys = Object.values(uploadData.sizes || {}).map(({ filename: rawFilename }) =>
+      prefix ? `${prefix}/${rawFilename}` : rawFilename,
+    )
 
     fileKeys.push(`${prefix ? `${prefix}/` : ''}${uploadData.filename}`)
 

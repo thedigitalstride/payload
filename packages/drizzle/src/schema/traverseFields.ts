@@ -24,6 +24,7 @@ import { createTableName } from '../createTableName.js'
 import { buildIndexName } from '../utilities/buildIndexName.js'
 import { getArrayRelationName } from '../utilities/getArrayRelationName.js'
 import { hasLocalesTable } from '../utilities/hasLocalesTable.js'
+import { isUUIDType } from '../utilities/isUUIDType.js'
 import {
   InternalBlockTableNameIndex,
   setInternalBlockIndex,
@@ -383,7 +384,7 @@ export const traverseFields = ({
 
         const disableNotNullFromHere = Boolean(field.admin?.condition) || disableNotNull
 
-        ;(field.blockReferences ?? field.blocks).forEach((_block) => {
+        field.blocks.forEach((_block) => {
           const block = typeof _block === 'string' ? adapter.payload.blocks[_block] : _block
 
           let blockTableName = createTableName({
@@ -395,14 +396,19 @@ export const traverseFields = ({
             versionsCustomName: versions,
           })
 
+          const isLocalizedBlockTable =
+            Boolean(isFieldLocalized && adapter.payload.config.localization) ||
+            withinLocalizedArrayOrBlock ||
+            forceLocalized
+
           if (typeof blocksTableNameMap[blockTableName] === 'undefined') {
             blocksTableNameMap[blockTableName] = 1
           } else if (
             !adapter.rawTables[blockTableName] ||
             !validateExistingBlockIsIdentical({
               block,
-              localized: field.localized,
-              rootTableName,
+              localized: isLocalizedBlockTable,
+              parentIsLocalized,
               table: adapter.rawTables[blockTableName],
               tableLocales: adapter.rawTables[`${blockTableName}${adapter.localesSuffix}`],
             })
@@ -464,12 +470,7 @@ export const traverseFields = ({
               },
             }
 
-            const isLocalized =
-              Boolean(isFieldLocalized && adapter.payload.config.localization) ||
-              withinLocalizedArrayOrBlock ||
-              forceLocalized
-
-            if (isLocalized) {
+            if (isLocalizedBlockTable) {
               baseColumns._locale = {
                 name: '_locale',
                 type: 'enum',
@@ -509,7 +510,7 @@ export const traverseFields = ({
               setColumnID,
               tableName: blockTableName,
               versions,
-              withinLocalizedArrayOrBlock: isLocalized,
+              withinLocalizedArrayOrBlock: isLocalizedBlockTable,
             })
 
             if (subHasLocalizedManyNumberField) {
@@ -621,6 +622,7 @@ export const traverseFields = ({
 
       case 'code':
       case 'email':
+      case 'slug':
       case 'textarea': {
         targetTable[fieldName] = withDefault(
           {
@@ -668,7 +670,7 @@ export const traverseFields = ({
           disableUnique,
           fieldPrefix: `${fieldName}.`,
           fields: field.flattenedFields,
-          forceLocalized: isFieldLocalized,
+          forceLocalized: isFieldLocalized || Boolean(forceLocalized),
           indexes,
           localesColumns,
           localesIndexes,
@@ -945,7 +947,7 @@ export const traverseFields = ({
           const tableName = adapter.tableNameMap.get(toSnakeCase(field.relationTo))
 
           // get the id type of the related collection
-          let colType: IDType = adapter.idType === 'uuid' ? 'uuid' : 'integer'
+          let colType: IDType = isUUIDType(adapter.idType) ? 'uuid' : 'integer'
           const relatedCollectionCustomID = relationshipConfig.fields.find(
             (field) => fieldAffectsData(field) && field.name === 'id',
           )

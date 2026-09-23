@@ -1,22 +1,14 @@
 import { decodeJwt } from 'jose'
 
 import type { Collection } from '../../collections/config/types.js'
-import type { TypedUser } from '../../index.js'
+import type { AuthenticatedUser } from '../../index.js'
 import type { JoinQuery, PayloadRequest, PopulateType, SelectType } from '../../types/index.js'
-import type { ClientUser } from '../types.js'
 
 export type MeOperationResult = {
   collection?: string
   exp?: number
-  /** @deprecated
-   * use:
-   * ```ts
-   * user._strategy
-   * ```
-   */
-  strategy?: string
   token?: string
-  user?: ClientUser
+  user?: AuthenticatedUser | null
 }
 
 export type Arguments = {
@@ -38,6 +30,12 @@ export const meOperation = async (args: Arguments): Promise<MeOperationResult> =
   }
 
   if (req.user) {
+    if (req.user.collection !== collection.config.slug) {
+      return {
+        user: null!,
+      }
+    }
+
     const { pathname } = req
     const isGraphQL = pathname === `/api${req.payload.config.routes.graphQL}`
 
@@ -52,17 +50,11 @@ export const meOperation = async (args: Arguments): Promise<MeOperationResult> =
       req,
       select,
       showHiddenFields: false,
-    })) as TypedUser
+    })) as AuthenticatedUser
 
     if (user) {
       user.collection = collection.config.slug
       user._strategy = req.user._strategy
-    }
-
-    if (req.user.collection !== collection.config.slug) {
-      return {
-        user: null!,
-      }
     }
 
     // /////////////////////////////////////
@@ -81,13 +73,6 @@ export const meOperation = async (args: Arguments): Promise<MeOperationResult> =
     }
 
     result.collection = req.user.collection
-    /** @deprecated
-     * use:
-     * ```ts
-     * user._strategy
-     * ```
-     */
-    result.strategy = req.user._strategy
 
     if (!result.user) {
       result.user = user

@@ -1,7 +1,13 @@
 import { status as httpStatus } from 'http-status'
 
 import type { FindOneArgs } from '../../database/types.js'
-import type { JsonObject, PayloadRequest, PopulateType, SelectType } from '../../types/index.js'
+import type {
+  JsonObject,
+  PayloadRequest,
+  PopulateType,
+  SelectType,
+  Where,
+} from '../../types/index.js'
 import type { Collection, TypeWithID } from '../config/types.js'
 import type { FindOptions } from './local/find.js'
 
@@ -13,13 +19,21 @@ import { afterChange } from '../../fields/hooks/afterChange/index.js'
 import { afterRead } from '../../fields/hooks/afterRead/index.js'
 import { beforeChange } from '../../fields/hooks/beforeChange/index.js'
 import { beforeValidate } from '../../fields/hooks/beforeValidate/index.js'
+import {
+  getLocalizedUploadProperties,
+  restoreUploadDataFromDocument,
+  sanitizeUploadData,
+} from '../../uploads/sanitizeUploadData.js'
 import { commitTransaction } from '../../utilities/commitTransaction.js'
 import { deepCopyObjectSimple } from '../../utilities/deepCopyObject.js'
 import { hasDraftValidationEnabled } from '../../utilities/getVersionsConfig.js'
 import { initTransaction } from '../../utilities/initTransaction.js'
+import { isolateObjectProperty } from '../../utilities/isolateObjectProperty.js'
 import { killTransaction } from '../../utilities/killTransaction.js'
+import { resolveSelect } from '../../utilities/resolveSelect.js'
 import { sanitizeSelect } from '../../utilities/sanitizeSelect.js'
 import { getLatestCollectionVersion } from '../../versions/getLatestCollectionVersion.js'
+import { getRestoredStatusesToAuthorize } from '../../versions/getRestoredStatusesToAuthorize.js'
 import { saveVersion } from '../../versions/saveVersion.js'
 import { buildAfterOperation } from './utilities/buildAfterOperation.js'
 import { buildBeforeOperation } from './utilities/buildBeforeOperation.js'
@@ -80,7 +94,7 @@ export const restoreVersionOperation = async <
     const { docs: versionDocs } = await req.payload.db.findVersions({
       collection: collectionConfig.slug,
       limit: 1,
-      locale: locale!,
+      locale: 'all',
       pagination: false,
       req,
       where: { id: { equals: id } },
@@ -92,16 +106,43 @@ export const restoreVersionOperation = async <
       throw new NotFound(req.t)
     }
 
-    const { parent: parentDocID, version: versionToRestoreWithLocales } = rawVersionToRestore
+    const { parent: parentDocID } = rawVersionToRestore
+    let versionToRestoreWithLocales = rawVersionToRestore.version
 
     // /////////////////////////////////////
     // Access
     // /////////////////////////////////////
 
-    const accessResults = !overrideAccess
-      ? await executeAccess({ id: parentDocID, req }, collectionConfig.access.update)
-      : true
-    const hasWherePolicy = hasWhereAccessResult(accessResults)
+    const restoredStatuses = draftArg
+      ? ['draft']
+      : getRestoredStatusesToAuthorize(versionToRestoreWithLocales?._status)
+
+    // A localized `_status` can publish and unpublish locales in one restore, so authorize every
+    // status it writes. executeAccess throws Forbidden on the first denial; Where constraints are
+    // AND-combined into the lookup below.
+    const accessResultsList: Array<boolean | Where> = []
+
+    if (overrideAccess) {
+      accessResultsList.push(true)
+    } else {
+      const statusesToAuthorize = restoredStatuses.length > 0 ? restoredStatuses : [undefined]
+
+      for (const status of statusesToAuthorize) {
+        accessResultsList.push(
+          await executeAccess(
+            {
+              id: parentDocID,
+              slug: collectionConfig.slug,
+              data: { _status: status },
+              req,
+            },
+            collectionConfig.access.update,
+          ),
+        )
+      }
+    }
+
+    const hasWherePolicy = accessResultsList.some((result) => hasWhereAccessResult(result))
 
     // /////////////////////////////////////
     // Retrieve document
@@ -109,9 +150,11 @@ export const restoreVersionOperation = async <
 
     const findOneArgs: FindOneArgs = {
       collection: collectionConfig.slug,
-      locale: locale!,
+      locale: 'all',
       req,
-      where: combineQueries({ id: { equals: parentDocID } }, accessResults),
+      where: accessResultsList.reduce<Where>((where, result) => combineQueries(where, result), {
+        id: { equals: parentDocID },
+      }),
     }
 
     // Get the document from the non versioned collection
@@ -143,6 +186,10 @@ export const restoreVersionOperation = async <
     })
 
     // originalDoc with hoisted localized data
+    const validationLocale = payload.config.localization
+      ? payload.config.localization.defaultLocale
+      : locale!
+
     const originalDoc = await afterRead({
       collection: collectionConfig,
       context: req.context,
@@ -151,14 +198,21 @@ export const restoreVersionOperation = async <
       draft: draftArg,
       fallbackLocale: null,
       global: null,
-      locale: locale!,
+      locale: validationLocale,
       overrideAccess: true,
       req,
       showHiddenFields: true,
     })
 
-    // version data with hoisted localized data
-    const prevVersionDoc = await afterRead({
+    if (collectionConfig.upload && !overrideAccess) {
+      versionToRestoreWithLocales = restoreUploadDataFromDocument(
+        sanitizeUploadData(versionToRestoreWithLocales, 'update'),
+        prevDocWithLocales,
+      )
+    }
+
+    // Use locale-hoisted version data for validation while preserving all locales in docWithLocales.
+    let prevVersionDoc = await afterRead({
       collection: collectionConfig,
       context: req.context,
       depth: 0,
@@ -166,15 +220,32 @@ export const restoreVersionOperation = async <
       draft: draftArg,
       fallbackLocale: null,
       global: null,
-      locale: locale!,
+      locale: validationLocale,
       overrideAccess: true,
       req,
       showHiddenFields: true,
     })
 
+    if (collectionConfig.upload && !overrideAccess) {
+      prevVersionDoc = restoreUploadDataFromDocument(
+        sanitizeUploadData(prevVersionDoc, 'update'),
+        prevDocWithLocales,
+        {
+          locale: validationLocale,
+          localizedProperties: getLocalizedUploadProperties(collectionConfig.flattenedFields),
+        },
+      )
+    }
+
     // /////////////////////////////////////
     // beforeValidate - Fields
     // /////////////////////////////////////
+
+    req.context.isRestoringVersion = true
+
+    const reqWithValidationLocale = isolateObjectProperty(req, ['fallbackLocale', 'locale'])
+    reqWithValidationLocale.fallbackLocale = null
+    reqWithValidationLocale.locale = validationLocale
 
     let data = await beforeValidate({
       id: parentDocID,
@@ -185,7 +256,7 @@ export const restoreVersionOperation = async <
       global: null,
       operation: 'update',
       overrideAccess,
-      req,
+      req: reqWithValidationLocale,
     })
 
     // /////////////////////////////////////
@@ -201,7 +272,7 @@ export const restoreVersionOperation = async <
             data,
             operation: 'update',
             originalDoc,
-            req,
+            req: reqWithValidationLocale,
           })) || data
       }
     }
@@ -219,7 +290,7 @@ export const restoreVersionOperation = async <
             data,
             operation: 'update',
             originalDoc,
-            req,
+            req: reqWithValidationLocale,
           })) || data
       }
     }
@@ -238,7 +309,7 @@ export const restoreVersionOperation = async <
       global: null,
       operation: 'update',
       overrideAccess,
-      req,
+      req: reqWithValidationLocale,
       skipValidation: draftArg && !hasDraftValidationEnabled(collectionConfig),
     })
 
@@ -248,8 +319,12 @@ export const restoreVersionOperation = async <
 
     const select = sanitizeSelect({
       fields: collectionConfig.flattenedFields,
-      forceSelect: collectionConfig.forceSelect,
-      select: incomingSelect,
+      select: resolveSelect({
+        config: collectionConfig.select,
+        operation: 'restoreVersion',
+        req,
+        select: incomingSelect,
+      }),
     })
 
     // Ensure updatedAt date is always updated
@@ -261,7 +336,7 @@ export const restoreVersionOperation = async <
         id: parentDocID,
         collection: collectionConfig.slug,
         data: result,
-        req,
+        req: reqWithValidationLocale,
         select,
       })
     }
@@ -278,7 +353,7 @@ export const restoreVersionOperation = async <
       draft: draftArg,
       operation: 'restoreVersion',
       payload,
-      req,
+      req: reqWithValidationLocale,
       select,
     })
 

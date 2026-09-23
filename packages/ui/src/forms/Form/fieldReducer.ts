@@ -225,7 +225,9 @@ export function fieldReducer(state: FormState, action: FieldAction): FormState {
         incomingState: serverState,
       })
 
-      prevStateRef.current = newState
+      if (prevStateRef) {
+        prevStateRef.current = newState
+      }
 
       return newState
     }
@@ -427,10 +429,13 @@ export function fieldReducer(state: FormState, action: FieldAction): FormState {
       }
 
       // reset `isModified` in all other fields
+      // Use destructuring instead of delete to avoid mutating field objects
+      // shared with the previous state (shallow copy shares references)
       if ('value' in action) {
         for (const [path, field] of Object.entries(newState)) {
           if (path !== action.path && 'isModified' in field) {
-            delete newState[path].isModified
+            const { isModified: _, ...fieldWithoutIsModified } = field
+            newState[path] = fieldWithoutIsModified as typeof field
           }
         }
       }

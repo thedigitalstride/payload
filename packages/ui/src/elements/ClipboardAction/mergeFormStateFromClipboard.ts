@@ -1,6 +1,20 @@
-import type { FieldState, FormState } from 'payload'
+import type { FieldState, FormState, Row } from 'payload'
+
+import ObjectIdImport from 'bson-objectid'
 
 import type { ClipboardPasteData } from './types.js'
+
+import { flattenRows, separateRows } from '../../forms/Form/rows.js'
+
+const ObjectId = 'default' in ObjectIdImport ? ObjectIdImport.default : ObjectIdImport
+
+// Strict path-prefix check: matches `prefix` exactly, or any descendant path (`prefix.`).
+// Required because numeric row indices share digit prefixes (`.1` vs `.10`/`.11`), and
+// field names can also share textual prefixes (`children` vs `childrenOther`). A loose
+// `startsWith(prefix)` leaks unrelated keys into clipboard / cleanup operations.
+function isStrictPathPrefix(key: string, prefix: string): boolean {
+  return key === prefix || key.startsWith(`${prefix}.`)
+}
 
 export function reduceFormStateByPath({
   formState,
@@ -15,7 +29,7 @@ export function reduceFormStateByPath({
   const prefix = typeof rowIndex !== 'number' ? path : `${path}.${rowIndex}`
 
   for (const key in formState) {
-    if (!key.startsWith(prefix)) {
+    if (!isStrictPathPrefix(key, prefix)) {
       continue
     }
 
@@ -80,7 +94,7 @@ export function mergeFormStateFromClipboard({
 
   if (fromRowToField) {
     const lastRenderedPath = `${path}.0`
-    const rowIDFromClipboard = dataFromClipboard[`${pathToReplace}.id`].value as string
+    const rowIDFromClipboard = dataFromClipboard[`${pathToReplace}.id`]?.value as string
     const hasRows = formState[path].rows?.length
 
     formState[path].rows = [
@@ -98,19 +112,24 @@ export function mergeFormStateFromClipboard({
     for (const fieldPath in formState) {
       if (
         fieldPath !== path &&
-        !fieldPath.startsWith(lastRenderedPath) &&
-        fieldPath.startsWith(path)
+        !isStrictPathPrefix(fieldPath, lastRenderedPath) &&
+        isStrictPathPrefix(fieldPath, path)
       ) {
         delete formState[fieldPath]
       }
     }
   }
 
+  // Map to track old IDs to new IDs for regenerating nested IDs
+  const idReplacements: Map<string, string> = new Map()
+
   for (const clipboardPath in dataFromClipboard) {
-    // Pasting a row id, skip overwriting
+    // When pasting into a specific row, skip only the direct row ID to avoid overwriting
+    // the target row's identity. Nested IDs (array item IDs within the block) should
+    // still be processed so they get regenerated below, preventing server-side duplication.
     if (
-      (!pasteIntoField && clipboardPath.endsWith('.id')) ||
-      !clipboardPath.startsWith(pathToReplace)
+      (!pasteIntoField && clipboardPath === `${pathToReplace}.id`) ||
+      !isStrictPathPrefix(clipboardPath, pathToReplace)
     ) {
       continue
     }
@@ -120,6 +139,24 @@ export function mergeFormStateFromClipboard({
     const customComponents = isArray ? formState[newPath]?.customComponents : undefined
     const validate = isArray ? formState[newPath]?.validate : undefined
 
+    // If this is an ID field, generate a new ID to prevent duplicates
+    if (clipboardPath.endsWith('.id') && dataFromClipboard[clipboardPath]?.value) {
+      const oldID = dataFromClipboard[clipboardPath].value as string
+      if (typeof oldID === 'string' && ObjectId.isValid(oldID)) {
+        const newID = new ObjectId().toHexString()
+        idReplacements.set(clipboardPath, newID)
+
+        formState[newPath] = {
+          customComponents,
+          validate,
+          ...dataFromClipboard[clipboardPath],
+          initialValue: newID,
+          value: newID,
+        }
+        continue
+      }
+    }
+
     formState[newPath] = {
       customComponents,
       validate,
@@ -127,5 +164,92 @@ export function mergeFormStateFromClipboard({
     }
   }
 
+  // Update parent field rows with new IDs
+  for (const [clipboardPath, newID] of idReplacements) {
+    const relativePath = clipboardPath.replace(`${pathToReplace}.`, '')
+    const segments = relativePath.split('.')
+
+    if (segments.length >= 2) {
+      const rowIndex = parseInt(segments[segments.length - 2], 10)
+      const parentFieldPath = segments.slice(0, segments.length - 2).join('.')
+      const fullParentPath = parentFieldPath ? `${targetSegment}.${parentFieldPath}` : targetSegment
+
+      if (formState[fullParentPath] && Array.isArray(formState[fullParentPath].rows)) {
+        const parentRows = formState[fullParentPath].rows
+        if (!isNaN(rowIndex) && parentRows[rowIndex]) {
+          parentRows[rowIndex].id = newID
+        }
+      }
+    } else if (segments.length === 1 && segments[0] === 'id') {
+      // Top-level block ID - extract field path and row index from targetSegment
+      const targetParts = targetSegment.split('.')
+      const lastPart = targetParts[targetParts.length - 1]
+      const rowIndexFromTarget = !isNaN(parseInt(lastPart, 10)) ? parseInt(lastPart, 10) : 0
+      const fieldPath = !isNaN(parseInt(lastPart, 10))
+        ? targetParts.slice(0, -1).join('.')
+        : targetSegment
+
+      if (formState[fieldPath] && Array.isArray(formState[fieldPath].rows)) {
+        const rows = formState[fieldPath].rows
+        if (rows[rowIndexFromTarget]) {
+          rows[rowIndexFromTarget].id = newID
+        }
+      }
+    }
+  }
+
   return formState
+}
+
+/**
+ * Inserts a new row at `rowIndex`, populated with clipboard data, without disturbing
+ * any existing rows. Existing rows at and after `rowIndex` are shifted down by one.
+ */
+export function insertRowFromClipboard({
+  dataFromClipboard: clipboardData,
+  formState,
+  path,
+  rowIndex,
+}: {
+  dataFromClipboard: ClipboardPasteData
+  formState: FormState
+  path: string
+  rowIndex: number
+}): FormState {
+  const { path: pathFromClipboard, rowIndex: rowIndexFromClipboard } = clipboardData
+
+  const sourceRowPath =
+    typeof rowIndexFromClipboard === 'number'
+      ? `${pathFromClipboard}.${rowIndexFromClipboard}`
+      : pathFromClipboard
+
+  const blockType = clipboardData.data[`${sourceRowPath}.blockType`]?.value as string | undefined
+
+  const newRowID = new ObjectId().toHexString()
+
+  const { remainingFields, rows } = separateRows(path, formState)
+
+  rows.splice(rowIndex, 0, {
+    id: { initialValue: newRowID, valid: true, value: newRowID },
+  })
+
+  const newRows = [...(formState[path].rows || [])]
+  const newRow: Row = { id: newRowID, isLoading: false }
+  if (blockType) {
+    newRow.blockType = blockType
+  }
+  newRows.splice(rowIndex, 0, newRow)
+
+  const formStateWithNewRow: FormState = {
+    ...remainingFields,
+    ...flattenRows(path, rows),
+    [path]: { ...formState[path], disableFormData: true, rows: newRows, value: rows.length },
+  }
+
+  return mergeFormStateFromClipboard({
+    dataFromClipboard: clipboardData,
+    formState: formStateWithNewRow,
+    path,
+    rowIndex,
+  })
 }
